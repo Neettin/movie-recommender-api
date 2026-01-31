@@ -4,13 +4,27 @@ import os
 import pandas as pd
 from dotenv import load_dotenv
 from sklearn.metrics.pairwise import cosine_similarity
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+# Create FastAPI app instance
+app = FastAPI(title="Movie Recommender API")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # 1. IMPORT YOUR DATA FROM LOADER
 from app.models.loader import model_assets
 
 # 2. ASSIGN THEM TO LOCAL VARIABLES
 movies = model_assets['movies']
-tfidf_matrix = model_assets['tfidf_matrix']  # Changed from 'similarity'
+tfidf_matrix = model_assets['tfidf_matrix']
 indices = model_assets['indices']
 
 # Create a lowercase index map for flexible searching
@@ -56,7 +70,6 @@ async def recommend(movie_title: str):
         similarity_scores = cosine_similarity(movie_vector, tfidf_matrix)[0]
         
         # 4. Get top 10 similar movies (excluding the movie itself)
-        # Create list of (index, score) tuples and sort by score
         movie_list = sorted(list(enumerate(similarity_scores)), reverse=True, key=lambda x: x[1])[1:11]
         
         print(f"DEBUG: Found {len(movie_list)} similar movies. Fetching posters...")
@@ -68,7 +81,6 @@ async def recommend(movie_title: str):
                 m_title = movies.iloc[i[0]]['title']
                 tasks.append(get_movie_poster_async(client, m_title))
             
-            # Wait for all 10 poster requests to finish
             posters = await asyncio.gather(*tasks)
             
             # 6. Format the final results
@@ -87,3 +99,20 @@ async def recommend(movie_title: str):
     except Exception as e:
         print(f"CRITICAL ERROR in recommend function: {e}")
         return []
+
+# API Endpoints
+@app.get("/")
+async def root():
+    return {"message": "Movie Recommender API is running!"}
+
+@app.get("/recommend/{movie_title}")
+async def get_recommendations(movie_title: str):
+    """
+    Get movie recommendations based on a movie title
+    """
+    recommendations = await recommend(movie_title)
+    return {"movie": movie_title, "recommendations": recommendations}
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "total_movies": len(movies)}
