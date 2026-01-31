@@ -1,0 +1,20 @@
+# Python environment
+venv/
+env/
+__pycache__/
+*.pyc
+
+# Sensitive Info
+.env
+
+# Frontend
+node_modules/
+dist/
+.eslintcache
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# NOTE: We are NOT ignoring /artifacts because they are < 100MB 
+# and required for the backend to function.
