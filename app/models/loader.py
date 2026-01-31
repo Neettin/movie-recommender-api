@@ -8,21 +8,21 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 ARTIFACTS_PATH = os.path.join(BASE_DIR, "artifacts")
 
 def load_artifacts():
-    print(f"--- RENDER-OPTIMIZED LOAD: {45447} movies ---")
+    print(f"--- RENDER-OPTIMIZED LOAD: {45447} movies with Full Metadata ---")
     try:
-        # 1. Load DataFrame as Memory Map (mmap)
-        # We load ONLY the title column to stay under 512MB
+        # 1. Load DataFrame as a Read-Only Memory Map
         movies_path = os.path.join(ARTIFACTS_PATH, "df.pkl")
         movies = joblib.load(movies_path, mmap_mode='r')
-        if isinstance(movies, pd.DataFrame):
-            movies = movies[['title']].copy() # Drop everything else
         
-        # 2. Load the Index Map
+        # IMPORTANT: Do NOT use .copy() or filter columns here.
+        # Selecting columns like movies[['title']] creates a new object in RAM.
+        # We leave the full 'movies' object as a memory-mapped reference.
+
+        # 2. Load the Index Map (Small enough for RAM)
         indices_path = os.path.join(ARTIFACTS_PATH, "indices.pkl")
         indices = joblib.load(indices_path)
 
         # 3. Load TF-IDF Matrix as Memory Map
-        # This is the secret to 512MB: it stays on disk until needed
         tfidf_path = os.path.join(ARTIFACTS_PATH, "tfidf_matrix.pkl")
         tfidf_matrix = joblib.load(tfidf_path, mmap_mode='r')
 

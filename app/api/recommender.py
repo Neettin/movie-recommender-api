@@ -2,122 +2,89 @@ import httpx
 import asyncio
 import os
 import numpy as np
-import pandas as pd
 from dotenv import load_dotenv
 from sklearn.metrics.pairwise import cosine_similarity
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
-# 1. IMPORT DATA FROM LOADER
-# This must use the 'mmap_mode' version of loader.py to fit in 512MB
 from app.models.loader import model_assets
 
-# Assign assets to variables
+# Load assets
 movies = model_assets['movies']
 tfidf_matrix = model_assets['tfidf_matrix']
 indices = model_assets['indices']
 
-# Pre-lowercase index keys once at startup to save CPU/Memory during requests
+# Optimization: Pre-lowercase indices for faster searching
 indices_lower = {str(k).strip().lower(): v for k, v in indices.items()}
 
-# Load environment variables
 load_dotenv()
 API_KEY = os.getenv("TMDB_API_KEY")
 
-# Initialize FastAPI
-app = FastAPI(title="Render Optimized Movie Recommender")
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-async def get_movie_poster_async(client: httpx.AsyncClient, title: str):
-    """
-    Fetches the poster URL from TMDb API. 
-    Returns a placeholder if not found or if the request fails.
-    """
-    if not API_KEY:
-        return "https://via.placeholder.com/500x750?text=No+API+Key"
-        
+async def fetch_api_details(client, title):
+    """Fallback to get poster, overview, and rating if local data is missing."""
+    if not API_KEY: return None
     url = f"https://api.themoviedb.org/3/search/movie?api_key={API_KEY}&query={title}"
     try:
-        response = await client.get(url, timeout=5.0)
-        if response.status_code == 200:
-            data = response.json()
-            if data.get('results'):
-                path = data['results'][0].get('poster_path')
-                if path:
-                    return f"https://image.tmdb.org/t/p/w500{path}"
-    except Exception:
-        pass
-    return f"https://via.placeholder.com/500x750?text={title.replace(' ', '+')}"
-
-async def recommend_logic(movie_title: str):
-    """
-    Core recommendation engine optimized for 512MB RAM.
-    """
-    try:
-        search_term = str(movie_title).strip().lower()
-
-        # 1. Find the index
-        if search_term not in indices_lower:
-            return []
-        
-        idx = indices_lower[search_term]
-
-        # 2. Compute similarity for ONLY the target movie (Memory Efficient)
-        # Using [idx] ensures we get a 2D row vector for cosine_similarity
-        movie_vector = tfidf_matrix[idx]
-        similarity_scores = cosine_similarity(movie_vector, tfidf_matrix).flatten()
-
-        # 3. Find top 10 using NumPy argpartition (Faster than sorting 45k items)
-        # It puts the top 11 values at the end of the array (unsorted)
-        top_indices = np.argpartition(similarity_scores, -11)[-11:]
-        
-        # Now sort just those 11 values to get the correct order
-        top_indices = top_indices[np.argsort(similarity_scores[top_indices])][::-1]
-
-        # Remove the movie itself from the recommendations
-        recommended_indices = [i for i in top_indices if i != idx][:10]
-
-        # 4. Fetch posters concurrently
-        async with httpx.AsyncClient() as client:
-            tasks = [get_movie_poster_async(client, movies.iloc[i]['title']) for i in recommended_indices]
-            posters = await asyncio.gather(*tasks)
-
-        # 5. Build results
-        results = []
-        for count, i in enumerate(recommended_indices):
-            movie_data = movies.iloc[i]
-            results.append({
-                "id": int(i),
-                "title": str(movie_data['title']),
-                "poster_path": posters[count]
-            })
-        
-        return results
-
-    except Exception as e:
-        print(f"Error in recommendation logic: {e}")
-        return []
-
-# --- API ENDPOINTS ---
-
-@app.get("/")
-async def root():
-    return {"status": "online", "movies_loaded": len(movies)}
+        resp = await client.get(url, timeout=5.0)
+        if resp.status_code == 200:
+            results = resp.json().get('results')
+            return results[0] if results else None
+    except: pass
+    return None
 
 @app.get("/recommend/{movie_title}")
 async def get_recommendations(movie_title: str):
-    data = await recommend_logic(movie_title)
-    if not data:
-        return {"movie": movie_title, "error": "Movie not found", "recommendations": []}
-    return {"movie": movie_title, "recommendations": data}
+    search_term = movie_title.strip().lower()
+    
+    if search_term not in indices_lower:
+        return {"error": "Movie not found", "recommendations": []}
 
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
+    # 1. Similarity Logic
+    idx = indices_lower[search_term]
+    query_vec = tfidf_matrix[idx]
+    sim_scores = cosine_similarity(query_vec, tfidf_matrix).flatten()
+
+    # 2. Get top 10 (excluding self)
+    top_indices = np.argpartition(sim_scores, -11)[-11:]
+    top_indices = top_indices[np.argsort(sim_scores[top_indices])][::-1]
+    recommended_indices = [i for i in top_indices if i != idx][:10]
+
+    # Combine: [Searched Movie] + [10 Recommendations]
+    final_indices = [idx] + recommended_indices
+
+    async with httpx.AsyncClient() as client:
+        # Concurrently fetch details for all 11 movies
+        tasks = [fetch_api_details(client, movies.iloc[i]['title']) for i in final_indices]
+        api_data_list = await asyncio.gather(*tasks)
+
+    results = []
+    for count, i in enumerate(final_indices):
+        m_local = movies.iloc[i]
+        m_api = api_data_list[count] or {}
+        
+        # Smart Data Selection (API data usually better/fresher)
+        results.append({
+            "is_searched": (count == 0),
+            "title": str(m_local['title']),
+            "poster_path": f"https://image.tmdb.org/t/p/w500{m_api.get('poster_path')}" if m_api.get('poster_path') else "https://via.placeholder.com/500x750",
+            "overview": m_api.get('overview') or m_local.get('overview') or "Plot details arriving soon...",
+            "genres": m_local.get('genres', ''),
+            "tagline": m_local.get('tagline', ''),
+            "original_language": str(m_local.get('original_language', 'en')).upper(),
+            "vote_average": round(float(m_api.get('vote_average') or m_local.get('vote_average', 0)), 1),
+            "popularity": round(float(m_api.get('popularity') or m_local.get('popularity', 0)), 1)
+        })
+
+    return {"recommendations": results}
+
+@app.get("/")
+def health_check():
+    return {"status": "online", "database_size": len(movies)}
