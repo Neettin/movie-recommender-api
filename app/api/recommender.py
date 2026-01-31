@@ -1,16 +1,32 @@
 import httpx
 import asyncio
 import os
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from sklearn.metrics.pairwise import cosine_similarity
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-# Create FastAPI app instance
-app = FastAPI(title="Movie Recommender API")
+# 1. IMPORT DATA FROM LOADER
+# This must use the 'mmap_mode' version of loader.py to fit in 512MB
+from app.models.loader import model_assets
 
-# Add CORS middleware
+# Assign assets to variables
+movies = model_assets['movies']
+tfidf_matrix = model_assets['tfidf_matrix']
+indices = model_assets['indices']
+
+# Pre-lowercase index keys once at startup to save CPU/Memory during requests
+indices_lower = {str(k).strip().lower(): v for k, v in indices.items()}
+
+# Load environment variables
+load_dotenv()
+API_KEY = os.getenv("TMDB_API_KEY")
+
+# Initialize FastAPI
+app = FastAPI(title="Render Optimized Movie Recommender")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,100 +35,89 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 1. IMPORT YOUR DATA FROM LOADER
-from app.models.loader import model_assets
-
-# 2. ASSIGN THEM TO LOCAL VARIABLES
-movies = model_assets['movies']
-tfidf_matrix = model_assets['tfidf_matrix']
-indices = model_assets['indices']
-
-# Create a lowercase index map for flexible searching
-indices_lower = {str(k).strip().lower(): v for k, v in indices.items()}
-
-load_dotenv()
-API_KEY = os.getenv("TMDB_API_KEY")
-
-async def get_movie_poster_async(client, title):
+async def get_movie_poster_async(client: httpx.AsyncClient, title: str):
     """
-    Searches TMDb by title to get the most accurate poster_path.
+    Fetches the poster URL from TMDb API. 
+    Returns a placeholder if not found or if the request fails.
     """
+    if not API_KEY:
+        return "https://via.placeholder.com/500x750?text=No+API+Key"
+        
     url = f"https://api.themoviedb.org/3/search/movie?api_key={API_KEY}&query={title}"
     try:
         response = await client.get(url, timeout=5.0)
         if response.status_code == 200:
             data = response.json()
-            if data.get('results') and len(data['results']) > 0:
+            if data.get('results'):
                 path = data['results'][0].get('poster_path')
                 if path:
                     return f"https://image.tmdb.org/t/p/w500{path}"
-    except Exception as e:
-        print(f"TMDb Search Error for {title}: {e}")
-    
-    return "https://via.placeholder.com/500x750?text=No+Poster"
+    except Exception:
+        pass
+    return f"https://via.placeholder.com/500x750?text={title.replace(' ', '+')}"
 
-async def recommend(movie_title: str):
+async def recommend_logic(movie_title: str):
+    """
+    Core recommendation engine optimized for 512MB RAM.
+    """
     try:
-        # Normalize the input
         search_term = str(movie_title).strip().lower()
-        print(f"--- Processing request for: {movie_title} (Requesting 10 results) ---")
 
-        # 1. Check if movie exists in our index
+        # 1. Find the index
         if search_term not in indices_lower:
-            print(f"DEBUG: '{search_term}' not found in dataset.")
             return []
-
-        # 2. Get the index of the movie
+        
         idx = indices_lower[search_term]
-        
-        # 3. Calculate similarity ON-DEMAND for this movie only
-        movie_vector = tfidf_matrix[idx]
-        similarity_scores = cosine_similarity(movie_vector, tfidf_matrix)[0]
-        
-        # 4. Get top 10 similar movies (excluding the movie itself)
-        movie_list = sorted(list(enumerate(similarity_scores)), reverse=True, key=lambda x: x[1])[1:11]
-        
-        print(f"DEBUG: Found {len(movie_list)} similar movies. Fetching posters...")
 
-        # 5. Fetch posters asynchronously using titles
+        # 2. Compute similarity for ONLY the target movie (Memory Efficient)
+        # Using [idx] ensures we get a 2D row vector for cosine_similarity
+        movie_vector = tfidf_matrix[idx]
+        similarity_scores = cosine_similarity(movie_vector, tfidf_matrix).flatten()
+
+        # 3. Find top 10 using NumPy argpartition (Faster than sorting 45k items)
+        # It puts the top 11 values at the end of the array (unsorted)
+        top_indices = np.argpartition(similarity_scores, -11)[-11:]
+        
+        # Now sort just those 11 values to get the correct order
+        top_indices = top_indices[np.argsort(similarity_scores[top_indices])][::-1]
+
+        # Remove the movie itself from the recommendations
+        recommended_indices = [i for i in top_indices if i != idx][:10]
+
+        # 4. Fetch posters concurrently
         async with httpx.AsyncClient() as client:
-            tasks = []
-            for i in movie_list:
-                m_title = movies.iloc[i[0]]['title']
-                tasks.append(get_movie_poster_async(client, m_title))
-            
+            tasks = [get_movie_poster_async(client, movies.iloc[i]['title']) for i in recommended_indices]
             posters = await asyncio.gather(*tasks)
-            
-            # 6. Format the final results
-            results = []
-            for count, i in enumerate(movie_list):
-                movie_data = movies.iloc[i[0]]
-                results.append({
-                    "id": count,
-                    "title": str(movie_data['title']),
-                    "poster_path": posters[count]
-                })
-            
-            print(f"DEBUG: Successfully prepared {len(results)} movies for '{movie_title}'")
-            return results
+
+        # 5. Build results
+        results = []
+        for count, i in enumerate(recommended_indices):
+            movie_data = movies.iloc[i]
+            results.append({
+                "id": int(i),
+                "title": str(movie_data['title']),
+                "poster_path": posters[count]
+            })
+        
+        return results
 
     except Exception as e:
-        print(f"CRITICAL ERROR in recommend function: {e}")
+        print(f"Error in recommendation logic: {e}")
         return []
 
-# API Endpoints
+# --- API ENDPOINTS ---
+
 @app.get("/")
 async def root():
-    return {"message": "Movie Recommender API is running!"}
+    return {"status": "online", "movies_loaded": len(movies)}
 
 @app.get("/recommend/{movie_title}")
 async def get_recommendations(movie_title: str):
-    """
-    Get movie recommendations based on a movie title
-    """
-    recommendations = await recommend(movie_title)
-    return {"movie": movie_title, "recommendations": recommendations}
+    data = await recommend_logic(movie_title)
+    if not data:
+        return {"movie": movie_title, "error": "Movie not found", "recommendations": []}
+    return {"movie": movie_title, "recommendations": data}
 
 @app.get("/health")
-async def health_check():
-    return {"status": "healthy", "total_movies": len(movies)}
+async def health():
+    return {"status": "healthy"}
