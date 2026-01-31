@@ -3,8 +3,10 @@ title: Movie Recommender API
 emoji: 🎬
 colorFrom: blue
 colorTo: purple
-sdk: gradio
-sdk_version: 3.50.2
-app_file: app.py
+sdk: docker
 pinned: false
 ---
+
+# Movie Recommender API
+
+FastAPI backend for movie recommendations
