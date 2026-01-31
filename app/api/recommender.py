@@ -3,13 +3,14 @@ import asyncio
 import os
 import pandas as pd
 from dotenv import load_dotenv
+from sklearn.metrics.pairwise import cosine_similarity
 
 # 1. IMPORT YOUR DATA FROM LOADER
 from app.models.loader import model_assets
 
 # 2. ASSIGN THEM TO LOCAL VARIABLES
 movies = model_assets['movies']
-similarity = model_assets['similarity']
+tfidf_matrix = model_assets['tfidf_matrix']  # Changed from 'similarity'
 indices = model_assets['indices']
 
 # Create a lowercase index map for flexible searching
@@ -50,12 +51,13 @@ async def recommend(movie_title: str):
         # 2. Get the index of the movie
         idx = indices_lower[search_term]
         
-        # 3. Get similarity scores for this movie
-        distances = similarity[idx]
+        # 3. Calculate similarity ON-DEMAND for this movie only
+        movie_vector = tfidf_matrix[idx]
+        similarity_scores = cosine_similarity(movie_vector, tfidf_matrix)[0]
         
-        # 4. INCREASED TO 10: 
-        # [1:11] takes 10 movies, skipping the first one (itself)
-        movie_list = sorted(list(enumerate(distances)), reverse=True, key=lambda x: x[1])[1:11]
+        # 4. Get top 10 similar movies (excluding the movie itself)
+        # Create list of (index, score) tuples and sort by score
+        movie_list = sorted(list(enumerate(similarity_scores)), reverse=True, key=lambda x: x[1])[1:11]
         
         print(f"DEBUG: Found {len(movie_list)} similar movies. Fetching posters...")
 
