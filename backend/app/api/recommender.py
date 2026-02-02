@@ -1,87 +1,90 @@
 import httpx
 import asyncio
 import os
-import pandas as pd
+import numpy as np
 from dotenv import load_dotenv
-
-# 1. IMPORT YOUR DATA FROM LOADER
+from sklearn.metrics.pairwise import cosine_similarity
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from app.models.loader import model_assets
 
-# 2. ASSIGN THEM TO LOCAL VARIABLES
+# Load assets
 movies = model_assets['movies']
-similarity = model_assets['similarity']
+tfidf_matrix = model_assets['tfidf_matrix']
 indices = model_assets['indices']
 
-# Create a lowercase index map for flexible searching
+# Optimization: Pre-lowercase indices for faster searching
 indices_lower = {str(k).strip().lower(): v for k, v in indices.items()}
 
 load_dotenv()
 API_KEY = os.getenv("TMDB_API_KEY")
 
-async def get_movie_poster_async(client, title):
-    """
-    Searches TMDb by title to get the most accurate poster_path.
-    """
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+async def fetch_api_details(client, title):
+    """Fallback to get poster, overview, and rating if local data is missing."""
+    if not API_KEY: return None
     url = f"https://api.themoviedb.org/3/search/movie?api_key={API_KEY}&query={title}"
     try:
-        response = await client.get(url, timeout=5.0)
-        if response.status_code == 200:
-            data = response.json()
-            if data.get('results') and len(data['results']) > 0:
-                path = data['results'][0].get('poster_path')
-                if path:
-                    return f"https://image.tmdb.org/t/p/w500{path}"
-    except Exception as e:
-        print(f"TMDb Search Error for {title}: {e}")
+        resp = await client.get(url, timeout=5.0)
+        if resp.status_code == 200:
+            results = resp.json().get('results')
+            return results[0] if results else None
+    except: pass
+    return None
+
+@app.get("/recommend/{movie_title}")
+async def get_recommendations(movie_title: str):
+    search_term = movie_title.strip().lower()
     
-    return "https://via.placeholder.com/500x750?text=No+Poster"
+    if search_term not in indices_lower:
+        return {"error": "Movie not found", "recommendations": []}
 
-async def recommend(movie_title: str):
-    try:
-        # Normalize the input
-        search_term = str(movie_title).strip().lower()
-        print(f"--- Processing request for: {movie_title} (Requesting 10 results) ---")
+    # 1. Similarity Logic
+    idx = indices_lower[search_term]
+    query_vec = tfidf_matrix[idx]
+    sim_scores = cosine_similarity(query_vec, tfidf_matrix).flatten()
 
-        # 1. Check if movie exists in our index
-        if search_term not in indices_lower:
-            print(f"DEBUG: '{search_term}' not found in dataset.")
-            return []
+    # 2. Get top 10 (excluding self)
+    top_indices = np.argpartition(sim_scores, -11)[-11:]
+    top_indices = top_indices[np.argsort(sim_scores[top_indices])][::-1]
+    recommended_indices = [i for i in top_indices if i != idx][:10]
 
-        # 2. Get the index of the movie
-        idx = indices_lower[search_term]
+    # Combine: [Searched Movie] + [10 Recommendations]
+    final_indices = [idx] + recommended_indices
+
+    async with httpx.AsyncClient() as client:
+        # Concurrently fetch details for all 11 movies
+        tasks = [fetch_api_details(client, movies.iloc[i]['title']) for i in final_indices]
+        api_data_list = await asyncio.gather(*tasks)
+
+    results = []
+    for count, i in enumerate(final_indices):
+        m_local = movies.iloc[i]
+        m_api = api_data_list[count] or {}
         
-        # 3. Get similarity scores for this movie
-        distances = similarity[idx]
-        
-        # 4. INCREASED TO 10: 
-        # [1:11] takes 10 movies, skipping the first one (itself)
-        movie_list = sorted(list(enumerate(distances)), reverse=True, key=lambda x: x[1])[1:11]
-        
-        print(f"DEBUG: Found {len(movie_list)} similar movies. Fetching posters...")
+        # Smart Data Selection (API data usually better/fresher)
+        results.append({
+            "is_searched": (count == 0),
+            "title": str(m_local['title']),
+            "poster_path": f"https://image.tmdb.org/t/p/w500{m_api.get('poster_path')}" if m_api.get('poster_path') else "https://via.placeholder.com/500x750",
+            "overview": m_api.get('overview') or m_local.get('overview') or "Plot details arriving soon...",
+            "genres": m_local.get('genres', ''),
+            "tagline": m_local.get('tagline', ''),
+            "original_language": str(m_local.get('original_language', 'en')).upper(),
+            "vote_average": round(float(m_api.get('vote_average') or m_local.get('vote_average', 0)), 1),
+            "popularity": round(float(m_api.get('popularity') or m_local.get('popularity', 0)), 1)
+        })
 
-        # 5. Fetch posters asynchronously using titles
-        async with httpx.AsyncClient() as client:
-            tasks = []
-            for i in movie_list:
-                m_title = movies.iloc[i[0]]['title']
-                tasks.append(get_movie_poster_async(client, m_title))
-            
-            # Wait for all 10 poster requests to finish
-            posters = await asyncio.gather(*tasks)
-            
-            # 6. Format the final results
-            results = []
-            for count, i in enumerate(movie_list):
-                movie_data = movies.iloc[i[0]]
-                results.append({
-                    "id": count,
-                    "title": str(movie_data['title']),
-                    "poster_path": posters[count]
-                })
-            
-            print(f"DEBUG: Successfully prepared {len(results)} movies for '{movie_title}'")
-            return results
+    return {"recommendations": results}
 
-    except Exception as e:
-        print(f"CRITICAL ERROR in recommend function: {e}")
-        return []
+@app.get("/")
+def health_check():
+    return {"status": "online", "database_size": len(movies)}

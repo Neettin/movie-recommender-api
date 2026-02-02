@@ -1,53 +1,43 @@
-import pickle
+import joblib
 import pandas as pd
 import os
-from sklearn.metrics.pairwise import cosine_similarity
+from scipy import sparse
+import gc
 
-# 1. SETUP PATHS
-# Climbs up from app/models/ to the root 'backend' folder
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-# Your folder containing .pkl files
 ARTIFACTS_PATH = os.path.join(BASE_DIR, "artifacts")
 
 def load_artifacts():
-    """
-    Loads movie data and generates a Cosine Similarity matrix on the fly
-    to ensure recommendation logic has real scores to sort.
-    """
+    print(f"--- RENDER-OPTIMIZED LOAD: {45447} movies with Full Metadata ---")
     try:
-        print(f"--- Loading ML Artifacts from: {ARTIFACTS_PATH} ---")
-        
-        # Load the Dataframe
+        # 1. Load DataFrame as a Read-Only Memory Map
         movies_path = os.path.join(ARTIFACTS_PATH, "df.pkl")
-        movies = pickle.load(open(movies_path, "rb"))
+        movies = joblib.load(movies_path, mmap_mode='r')
         
-        # Load the TF-IDF Matrix (The features)
-        tfidf_matrix_path = os.path.join(ARTIFACTS_PATH, "tfidf_matrix.pkl")
-        tfidf_matrix = pickle.load(open(tfidf_matrix_path, "rb"))
-        
-        # IMPORTANT: Generate Similarity Matrix from TF-IDF Matrix
-        # This converts (5000, 10000) features into a (5000, 5000) score matrix
-        print("--- Calculating Cosine Similarity Matrix... ---")
-        similarity = cosine_similarity(tfidf_matrix)
-        
-        # Load the Title-to-Index Map
+        # IMPORTANT: Do NOT use .copy() or filter columns here.
+        # Selecting columns like movies[['title']] creates a new object in RAM.
+        # We leave the full 'movies' object as a memory-mapped reference.
+
+        # 2. Load the Index Map (Small enough for RAM)
         indices_path = os.path.join(ARTIFACTS_PATH, "indices.pkl")
-        indices = pickle.load(open(indices_path, "rb"))
-        
-        print(f"--- All Artifacts Loaded Successfully! Matrix Shape: {similarity.shape} ---")
-        
+        indices = joblib.load(indices_path)
+
+        # 3. Load TF-IDF Matrix as Memory Map
+        tfidf_path = os.path.join(ARTIFACTS_PATH, "tfidf_matrix.pkl")
+        tfidf_matrix = joblib.load(tfidf_path, mmap_mode='r')
+
+        # Ensure it is a CSR matrix for fast math
+        if not sparse.issparse(tfidf_matrix):
+            tfidf_matrix = sparse.csr_matrix(tfidf_matrix)
+
+        gc.collect()
         return {
             "movies": movies,
-            "similarity": similarity,
+            "tfidf_matrix": tfidf_matrix,
             "indices": indices
         }
-        
-    except FileNotFoundError as e:
-        print(f"CRITICAL ERROR: Could not find a .pkl file. {e}")
-        raise e
     except Exception as e:
-        print(f"AN UNEXPECTED ERROR OCCURRED: {e}")
+        print(f"Load Error: {e}")
         raise e
 
-# Create the global asset variable used by recommender.py
 model_assets = load_artifacts()

@@ -1,6 +1,9 @@
 fastapi
-uvicorn
-pandas
+uvicorn[standard]
 scikit-learn
+pandas
+numpy
 httpx
 python-dotenv
+scipy
+joblib
