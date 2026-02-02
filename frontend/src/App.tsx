@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { Search, Film, Loader2, Star, TrendingUp, X, Globe, Flame, Sword, Heart, Laugh, Cpu, Skull, Zap, Compass, Users, Music, BookOpen, Bookmark, Share2, Moon, Sun, Clock, Calendar, Eye, Popcorn, Grid, List } from "lucide-react";
+import { Search, Film, Loader2, Star, TrendingUp, X, Globe, Flame, Sword, Heart, Laugh, Cpu, Skull, Zap, Compass, Users, Music, BookOpen, Bookmark, Share2, Moon, Sun, Clock, Calendar, Eye, Popcorn} from "lucide-react";
 
 /* ─────────────────────────────────────────────
    TYPES
